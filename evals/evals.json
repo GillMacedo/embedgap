@@ -1,0 +1,27 @@
+[
+  {
+    "skills": ["checking-go-embed"],
+    "query": "Our Go server returns 404 for /static/app.css, but the file is in the repo. Why?",
+    "expected_behavior": [
+      "Runs embedgap.go on the module",
+      "Points to the fs.Sub or //go:embed line it reports, with file:line",
+      "Doesn't edit code without being asked"
+    ]
+  },
+  {
+    "skills": ["checking-go-embed"],
+    "query": "Check that every file this service reads from embed.FS is really embedded.",
+    "expected_behavior": [
+      "Runs the tool and reads the exit code first",
+      "Lists the unchecked paths from the notes and doesn't call them fine"
+    ]
+  },
+  {
+    "skills": ["checking-go-embed"],
+    "query": "embedgap exited 2. Is the code fine then?",
+    "expected_behavior": [
+      "Says exit 2 means nothing was checked",
+      "Explains the reason from the message, such as a build error or a missing frontend build"
+    ]
+  }
+]

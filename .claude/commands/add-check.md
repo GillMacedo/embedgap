@@ -1,0 +1,1 @@
+Add a check for: $ARGUMENTS. Use a new stable finding code in `plugin/scripts/embedgap.go`, add a test in `TestFindings` for what it flags and a case that must stay quiet, run it on `examples/` and on one real project, and add it to the README table. An ERROR must mean the call fails at run time.

@@ -1,0 +1,13 @@
+{
+  "name": "embedgap",
+  "version": "0.1.0",
+  "description": "Find Go embed.FS reads that compile and then fail at run time: paths //go:embed never included, files skipped because they start with _ or ., wrong fs.Sub directories, ParseFS patterns that match nothing, and secrets pulled in by all: patterns.",
+  "author": {
+    "name": "Giulliano Macedo",
+    "url": "https://github.com/GillMacedo"
+  },
+  "homepage": "https://github.com/GillMacedo/embedgap",
+  "repository": "https://github.com/GillMacedo/embedgap",
+  "license": "MIT",
+  "keywords": ["go", "golang", "go-embed", "embed-fs", "static-analysis", "code-review", "ci"]
+}

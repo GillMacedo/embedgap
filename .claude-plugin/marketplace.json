@@ -1,0 +1,14 @@
+{
+  "name": "embedgap-marketplace",
+  "description": "Marketplace for embedgap, which finds Go embed.FS reads that fail at run time.",
+  "owner": {
+    "name": "Giulliano Macedo"
+  },
+  "plugins": [
+    {
+      "name": "embedgap",
+      "source": "./plugin",
+      "description": "Find Go embed.FS reads that compile and then fail at run time: paths //go:embed never included, files skipped because they start with _ or ., wrong fs.Sub directories and ParseFS patterns that match nothing."
+    }
+  ]
+}
