@@ -227,6 +227,18 @@ func TestFindings(t *testing.T) {
 			not:   []string{"no-match", "not-embedded"},
 		},
 		{
+			name:  "run-time glob that can match stays quiet",
+			body:  "//go:embed templates/*.html\nvar tmpl embed.FS\n\nfunc f(name string) {\n\ttemplate.ParseFS(tmpl, \"templates/\"+name+\".html\")\n}\n",
+			files: map[string]string{"templates/index.html": "x"},
+			not:   []string{"no-match", "not-embedded"},
+		},
+		{
+			name:  "run-time glob that can't match",
+			body:  "//go:embed data\nvar data embed.FS\n\nfunc f(name string) {\n\tfs.Glob(data, \"data/\"+name+\".json\") // M1\n}\n",
+			files: map[string]string{"data/a.yaml": "x"},
+			want:  map[string]string{"no-match": "M1"},
+		},
+		{
 			name:  "leading slash",
 			body:  "//go:embed static\nvar static embed.FS\n\nfunc f() { static.ReadFile(\"/static/a.txt\") // M1\n}\n",
 			files: map[string]string{"static/a.txt": "x"},

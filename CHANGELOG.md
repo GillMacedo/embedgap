@@ -4,6 +4,9 @@ All notable changes are documented here, in [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+- Checks `ParseFS` and `fs.Glob` patterns built at run time, like `"templates/" + name + ".html"`, for any possible match.
+
 ## [0.1.0] - 2026-11-07
 
 ### Added
