@@ -113,7 +113,7 @@ It never runs the module's code. Compiling does run cgo's C compiler for package
 ## Limits
 
 - **One build configuration per run.** Files whose build constraints don't match the current GOOS, GOARCH and tags are listed in a note, and not checked. Run it again with `GOOS=windows` or `GOFLAGS=-tags=...` to cover them.
-- **Paths built at run time are only partly checked.** A path or glob with a fixed part, like `"static/" + name` or `"templates/" + name + ".html"`, is checked for any possible match. A path with no fixed part, a path read from a map or a config file, and `ParseFS(fsys, patterns...)` with a slice are listed in a note, not checked.
+- **Paths built at run time are only partly checked.** A path with a fixed part, like `"static/" + name`, is checked for any possible match, and a loop over a local map or slice literal of string constants is checked one value at a time. A path with no fixed part, a glob built at run time, a path read from a config file, and `ParseFS(fsys, patterns...)` with a slice are listed in a note, not checked.
 - **It follows embed variables through assignments, `fs.Sub` and exported variables.** An `fs.FS` passed as a function argument, stored in a struct field, or assigned from two different sources isn't followed, so reads through it aren't checked.
 - **Generated assets must exist first.** A pattern like `//go:embed dist` with no `dist` folder yet is a build error, so it exits 2. Run the frontend build first.
 - **Nested modules need their own run,** because `go list ./...` stops at a `go.mod`.

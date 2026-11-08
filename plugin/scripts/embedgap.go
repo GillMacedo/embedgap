@@ -588,10 +588,11 @@ func (v *embedVar) describe() string {
 // unit is a set of files type-checked together: a package with its internal
 // tests, or its external _test package.
 type unit struct {
-	files  []*ast.File
-	names  []string // relative to the module directory
-	info   *types.Info
-	isTest bool
+	files     []*ast.File
+	names     []string // relative to the module directory
+	info      *types.Info
+	isTest    bool
+	rangeVals map[types.Object][]string // values of range variables over local literals
 }
 
 type pkgState struct {
@@ -992,6 +993,7 @@ func (c *checker) trackAll() {
 				path += "_test"
 			}
 			conf.Check(path, c.fset, u.files, u.info)
+			u.rangeVals = findRangeVals(u)
 		}
 		for _, v := range ps.vars {
 			if v.kind != kindFS {
@@ -1244,6 +1246,325 @@ func joinPrefix(prefix, p string) string {
 }
 
 // ---------------------------------------------------------------------------
+// Range variables over local literals
+
+const (
+	maxRangeVals   = 100 // values tracked for one range variable
+	maxRangeCombos = 100 // checks for one path expression
+)
+
+// findRangeVals maps each variable defined by a range clause over a local map
+// or slice literal of string constants to the values it can take. miniflux
+// reads its templates in a loop over a map of file names, for example.
+func findRangeVals(u *unit) map[types.Object][]string {
+	litOf := map[types.Object]*ast.CompositeLit{}
+	bad := map[types.Object]bool{}
+	assigned := map[types.Object]bool{}
+	obj := func(e ast.Expr) types.Object {
+		id, ok := unparen(e).(*ast.Ident)
+		if !ok || id.Name == "_" {
+			return nil
+		}
+		if o := u.info.Defs[id]; o != nil {
+			return o
+		}
+		return u.info.Uses[id]
+	}
+	local := func(o types.Object) bool {
+		v, ok := o.(*types.Var)
+		return ok && v.Pkg() != nil && v.Parent() != v.Pkg().Scope()
+	}
+	note := func(lhs, rhs []ast.Expr) {
+		for i, l := range lhs {
+			o := obj(l)
+			if o == nil {
+				continue
+			}
+			assigned[o] = true
+			if i >= len(rhs) || !local(o) {
+				continue
+			}
+			lit, ok := unparen(rhs[i]).(*ast.CompositeLit)
+			if !ok || bad[o] || litOf[o] != nil {
+				bad[o] = true
+				delete(litOf, o)
+				continue
+			}
+			litOf[o] = lit
+		}
+	}
+	for _, f := range u.files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				note(x.Lhs, x.Rhs)
+			case *ast.ValueSpec:
+				if len(x.Values) == 0 {
+					return true
+				}
+				lhs := make([]ast.Expr, len(x.Names))
+				for i, id := range x.Names {
+					lhs[i] = id
+				}
+				note(lhs, x.Values)
+			case *ast.IncDecStmt:
+				if o := obj(x.X); o != nil {
+					assigned[o] = true
+				}
+			case *ast.UnaryExpr:
+				if x.Op == token.AND {
+					if o := obj(x.X); o != nil {
+						assigned[o] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	var ranges []*ast.RangeStmt
+	rangeX := map[types.Object]map[token.Pos]bool{}
+	for _, f := range u.files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if r, ok := n.(*ast.RangeStmt); ok {
+				ranges = append(ranges, r)
+				if id, ok := unparen(r.X).(*ast.Ident); ok {
+					if o := u.info.Uses[id]; o != nil {
+						if rangeX[o] == nil {
+							rangeX[o] = map[token.Pos]bool{}
+						}
+						rangeX[o][id.Pos()] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	// A literal is trusted only when its variable is used nowhere but as a
+	// range expression, so an index assignment or a delete can't change it.
+	for _, f := range u.files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			o := u.info.Uses[id]
+			if o == nil || litOf[o] == nil {
+				return true
+			}
+			if !rangeX[o][id.Pos()] {
+				bad[o] = true
+				delete(litOf, o)
+			}
+			return true
+		})
+	}
+	vals := map[types.Object][]string{}
+	elems := map[types.Object][]string{}
+	add := func(m map[types.Object][]string, o types.Object, ss []string, changed *bool) {
+		if o == nil || len(ss) == 0 || assigned[o] {
+			return
+		}
+		for _, s := range ss {
+			if !hasString(m[o], s) {
+				m[o] = append(m[o], s)
+				*changed = true
+			}
+		}
+		if len(m[o]) > maxRangeVals {
+			delete(m, o)
+			assigned[o] = true
+		}
+	}
+	for round := 0; round < 8; round++ {
+		changed := false
+		for _, r := range ranges {
+			keys, values, elemValues, isMap, ok := rangeLiteral(u, r.X, litOf, elems)
+			if !ok {
+				continue
+			}
+			if !isMap {
+				add(vals, rangeObj(u, r.Value), values, &changed)
+				continue
+			}
+			add(vals, rangeObj(u, r.Key), keys, &changed)
+			if v := rangeObj(u, r.Value); v != nil {
+				add(vals, v, values, &changed)
+				add(elems, v, elemValues, &changed)
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return vals
+}
+
+// rangeObj returns the variable a range clause defines for e.
+func rangeObj(u *unit, e ast.Expr) types.Object {
+	id, ok := unparen(e).(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return nil
+	}
+	return u.info.Defs[id]
+}
+
+// rangeLiteral returns the constants a range over e yields. For a map, keys
+// and values are the keys and string values; elemValues are the elements of
+// []string values. For a slice, values are the elements.
+func rangeLiteral(u *unit, e ast.Expr, litOf map[types.Object]*ast.CompositeLit, elems map[types.Object][]string) (keys, values, elemValues []string, isMap, ok bool) {
+	var lit *ast.CompositeLit
+	switch x := unparen(e).(type) {
+	case *ast.CompositeLit:
+		lit = x
+	case *ast.Ident:
+		o := u.info.Uses[x]
+		if o == nil {
+			return nil, nil, nil, false, false
+		}
+		if lit = litOf[o]; lit == nil {
+			if ev, found := elems[o]; found {
+				return nil, ev, nil, false, true
+			}
+			return nil, nil, nil, false, false
+		}
+	default:
+		return nil, nil, nil, false, false
+	}
+	return litRangeValues(u, lit)
+}
+
+func litRangeValues(u *unit, lit *ast.CompositeLit) (keys, values, elemValues []string, isMap, ok bool) {
+	if _, isMap = lit.Type.(*ast.MapType); isMap {
+		for _, e := range lit.Elts {
+			kv, isKV := e.(*ast.KeyValueExpr)
+			if !isKV {
+				return nil, nil, nil, true, false
+			}
+			k, ok := constString(u, kv.Key)
+			if !ok {
+				return nil, nil, nil, true, false
+			}
+			keys = append(keys, k)
+			if v, isLit := unparen(kv.Value).(*ast.CompositeLit); isLit {
+				ss, ok := litStrings(u, v)
+				if !ok {
+					return nil, nil, nil, true, false
+				}
+				elemValues = append(elemValues, ss...)
+				continue
+			}
+			s, ok := constString(u, kv.Value)
+			if !ok {
+				return nil, nil, nil, true, false
+			}
+			values = append(values, s)
+		}
+		return keys, values, elemValues, true, true
+	}
+	ss, ok := litStrings(u, lit)
+	return nil, ss, nil, false, ok
+}
+
+func litStrings(u *unit, lit *ast.CompositeLit) ([]string, bool) {
+	var out []string
+	for _, e := range lit.Elts {
+		if _, ok := e.(*ast.KeyValueExpr); ok {
+			return nil, false
+		}
+		s, ok := constString(u, e)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, s)
+	}
+	return out, true
+}
+
+func constString(u *unit, e ast.Expr) (string, bool) {
+	tv, ok := u.info.Types[e]
+	if !ok || tv.Value == nil || tv.Value.Kind() != constant.String {
+		return "", false
+	}
+	return constant.StringVal(tv.Value), true
+}
+
+func hasString(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// rangeSubs lists the substitutions to try for a path expression: one map
+// per combination of range variables in it, or nil if there are too many.
+func rangeSubs(u *unit, e ast.Expr) []map[types.Object]string {
+	var objs []types.Object
+	seen := map[types.Object]bool{}
+	ast.Inspect(e, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			return true
+		}
+		o := u.info.Uses[id]
+		if o == nil || seen[o] {
+			return true
+		}
+		if _, ok := u.rangeVals[o]; ok {
+			seen[o] = true
+			objs = append(objs, o)
+		}
+		return true
+	})
+	subs := []map[types.Object]string{{}}
+	for _, o := range objs {
+		vs := u.rangeVals[o]
+		if len(subs)*len(vs) > maxRangeCombos {
+			return nil
+		}
+		next := make([]map[types.Object]string, 0, len(subs)*len(vs))
+		for _, sub := range subs {
+			for _, v := range vs {
+				m := make(map[types.Object]string, len(sub)+1)
+				for k, x := range sub {
+					m[k] = x
+				}
+				m[o] = v
+				next = append(next, m)
+			}
+		}
+		subs = next
+	}
+	return subs
+}
+
+// substitute returns e with the range variables in sub replaced by string
+// literals. Positions stay put, so findings keep their line.
+func substitute(u *unit, e ast.Expr, sub map[types.Object]string) ast.Expr {
+	switch x := unparen(e).(type) {
+	case *ast.Ident:
+		if o := u.info.Uses[x]; o != nil {
+			if v, ok := sub[o]; ok {
+				return &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(v), ValuePos: x.Pos()}
+			}
+		}
+		return x
+	case *ast.BasicLit:
+		return x
+	case *ast.BinaryExpr:
+		return &ast.BinaryExpr{X: substitute(u, x.X, sub), Op: x.Op, Y: substitute(u, x.Y, sub)}
+	case *ast.CallExpr:
+		args := make([]ast.Expr, len(x.Args))
+		for i := range args {
+			args[i] = substitute(u, x.Args[i], sub)
+		}
+		return &ast.CallExpr{Fun: substitute(u, x.Fun, sub), Args: args, Ellipsis: x.Ellipsis}
+	}
+	return e
+}
+
+// ---------------------------------------------------------------------------
 // Path expressions
 
 type pathKind int
@@ -1274,6 +1595,12 @@ func (c *checker) evalPath(u *unit, e ast.Expr) pathVal {
 		return pathVal{kind: pathConst, value: constant.StringVal(tv.Value)}
 	}
 	switch x := e.(type) {
+	case *ast.BasicLit:
+		if x.Kind == token.STRING {
+			if s, err := strconv.Unquote(x.Value); err == nil {
+				return pathVal{kind: pathConst, value: s}
+			}
+		}
 	case *ast.BinaryExpr:
 		if x.Op == token.ADD {
 			return concat(c.evalPath(u, x.X), c.evalPath(u, x.Y))
@@ -1636,6 +1963,17 @@ func entries(ref *fsRef, w want) []string {
 
 func (c *checker) checkPath(u *unit, fileName string, call *ast.CallExpr, label string, ref *fsRef, pe ast.Expr, w want) {
 	line := c.fset.Position(pe.Pos()).Line
+	subs := rangeSubs(u, pe)
+	if subs == nil {
+		c.unchecked = append(c.unchecked, fmt.Sprintf("%s:%d %s", fileName, line, label))
+		return
+	}
+	for _, sub := range subs {
+		c.checkOnePath(u, fileName, line, label, ref, substitute(u, pe, sub), w)
+	}
+}
+
+func (c *checker) checkOnePath(u *unit, fileName string, line int, label string, ref *fsRef, pe ast.Expr, w want) {
 	pv := c.evalPath(u, pe)
 	where := ref.v.describe()
 	if ref.prefix != "." {
