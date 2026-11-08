@@ -94,7 +94,7 @@ So a broken build can't pass CI as a clean result. In CI:
 | Code | Severity | Finds |
 |---|---|---|
 | `not-embedded` | ERROR | A fixed path that no `//go:embed` pattern includes, with the reason: a typo, a file left out by the `_` and `.` rule, a file in another embed variable, a file on disk the pattern misses, or a directory read as a file |
-| `no-match` | ERROR | A `ParseFS` or `fs.Glob` pattern that matches nothing, or a path built at run time, like `"migration/" + name + ".sql"`, whose fixed parts can't match any embedded file |
+| `no-match` | ERROR | A `ParseFS` or `fs.Glob` pattern that matches nothing, or a path or glob built at run time, like `"migration/" + name + ".sql"`, whose fixed parts can't match any embedded file |
 | `matches-dir` | ERROR | A `ParseFS` pattern that matches a directory, which `ParseFS` fails on |
 | `invalid-path` | ERROR | A path with a leading `/` or `./`, a `..` element or a backslash, which `io/fs` always rejects |
 | `bad-pattern` | ERROR | A malformed glob |
@@ -113,7 +113,7 @@ It never runs the module's code. Compiling does run cgo's C compiler for package
 ## Limits
 
 - **One build configuration per run.** Files whose build constraints don't match the current GOOS, GOARCH and tags are listed in a note, and not checked. Run it again with `GOOS=windows` or `GOFLAGS=-tags=...` to cover them.
-- **Paths built at run time are only partly checked.** A path with a fixed part, like `"static/" + name`, is checked for any possible match. A path with no fixed part, a glob built at run time, a path read from a map or a config file, and `ParseFS(fsys, patterns...)` with a slice are listed in a note, not checked.
+- **Paths built at run time are only partly checked.** A path or glob with a fixed part, like `"static/" + name` or `"templates/" + name + ".html"`, is checked for any possible match. A path with no fixed part, a path read from a map or a config file, and `ParseFS(fsys, patterns...)` with a slice are listed in a note, not checked.
 - **It follows embed variables through assignments, `fs.Sub` and exported variables.** An `fs.FS` passed as a function argument, stored in a struct field, or assigned from two different sources isn't followed, so reads through it aren't checked.
 - **Generated assets must exist first.** A pattern like `//go:embed dist` with no `dist` folder yet is a build error, so it exits 2. Run the frontend build first.
 - **Nested modules need their own run,** because `go list ./...` stops at a `go.mod`.

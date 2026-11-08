@@ -1377,6 +1377,125 @@ func (p pathVal) regexp() *regexp.Regexp {
 	return regexp.MustCompile(b.String())
 }
 
+// globRegexp turns the fixed parts of a glob built at run time into a regular
+// expression. Glob characters in the fixed parts are translated, and each
+// run-time part matches anything.
+func globRegexp(parts []string) (*regexp.Regexp, bool) {
+	var b strings.Builder
+	b.WriteString("^")
+	for i, part := range parts {
+		if i > 0 {
+			b.WriteString(".*")
+		}
+		if !appendGlobRegex(&b, part) {
+			return nil, false
+		}
+	}
+	b.WriteString("$")
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return nil, false
+	}
+	return re, true
+}
+
+// appendGlobRegex writes the regular expression for one fixed part of a glob,
+// following the path.Match syntax.
+func appendGlobRegex(b *strings.Builder, s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		switch r {
+		case '*':
+			b.WriteString("[^/]*")
+		case '?':
+			b.WriteString("[^/]")
+		case '\\':
+			if i >= len(s) {
+				return false
+			}
+			c, n := utf8.DecodeRuneInString(s[i:])
+			i += n
+			b.WriteString(regexp.QuoteMeta(string(c)))
+		case '[':
+			var ok bool
+			if i, ok = appendGlobClass(b, s, i); !ok {
+				return false
+			}
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	return true
+}
+
+// appendGlobClass writes a path.Match character class and returns the index
+// after it.
+func appendGlobClass(b *strings.Builder, s string, i int) (int, bool) {
+	b.WriteByte('[')
+	if i < len(s) && s[i] == '^' {
+		b.WriteByte('^')
+		i++
+	}
+	n := 0
+	for {
+		if i >= len(s) {
+			return i, false
+		}
+		if s[i] == ']' {
+			if n == 0 {
+				return i, false // an empty class is invalid
+			}
+			b.WriteByte(']')
+			return i + 1, true
+		}
+		lo, next, ok := globClassChar(s, i)
+		if !ok {
+			return i, false
+		}
+		i = next
+		n++
+		if i < len(s) && s[i] == '-' && i+1 < len(s) && s[i+1] != ']' {
+			hi, next, ok := globClassChar(s, i+1)
+			if !ok {
+				return i, false
+			}
+			i = next
+			writeClassChar(b, lo)
+			b.WriteByte('-')
+			writeClassChar(b, hi)
+		} else {
+			writeClassChar(b, lo)
+		}
+	}
+}
+
+// globClassChar reads one character of a class, including a backslash escape.
+func globClassChar(s string, i int) (rune, int, bool) {
+	if i >= len(s) || s[i] == ']' || s[i] == '-' {
+		return 0, i, false
+	}
+	if s[i] == '\\' {
+		i++
+		if i >= len(s) {
+			return 0, i, false
+		}
+	}
+	r, n := utf8.DecodeRuneInString(s[i:])
+	if r == utf8.RuneError && n == 1 {
+		return 0, i, false
+	}
+	return r, i + n, true
+}
+
+// writeClassChar writes one character for a regular expression class.
+func writeClassChar(b *strings.Builder, r rune) {
+	if strings.ContainsRune(`\^-]`, r) {
+		b.WriteByte('\\')
+	}
+	b.WriteRune(r)
+}
+
 // ---------------------------------------------------------------------------
 // Checking calls
 
@@ -1538,7 +1657,25 @@ func (c *checker) checkPath(u *unit, fileName string, call *ast.CallExpr, label 
 	}
 	if pv.kind == pathPartial {
 		if w == wantGlob || w == wantParseFS {
-			// A glob built at run time: check only that something exists.
+			// A glob built at run time: check that some embedded path can match.
+			re, ok := globRegexp(pv.parts)
+			if ok {
+				for _, e := range entries(ref, wantAny) {
+					if re.MatchString(e) {
+						c.unchecked = append(c.unchecked, fmt.Sprintf("%s:%d %s", fileName, line, label))
+						c.checked--
+						return
+					}
+				}
+				verb := "returns no matches and no error"
+				if w == wantParseFS {
+					verb = "fails at run time with \"pattern matches no files\""
+				}
+				c.add(finding{Severity: sevError, File: fileName, Line: line, Code: "no-match",
+					Message: fmt.Sprintf("%s(%s) %s: nothing embedded can match it, whatever the run-time part is", label, pv.display(), verb),
+					Details: []string{"embedded in " + where}})
+				return
+			}
 			c.unchecked = append(c.unchecked, fmt.Sprintf("%s:%d %s", fileName, line, label))
 			c.checked--
 			return
