@@ -311,6 +311,18 @@ func TestFindings(t *testing.T) {
 			files: map[string]string{"static/a.txt": "x"},
 			not:   []string{"not-embedded"},
 		},
+		{
+			name:  "parameter always gets the same embed variable",
+			body:  "//go:embed static\nvar static embed.FS\n\n//go:embed other\nvar other embed.FS\n\nfunc serve(fsys fs.FS) {\n\tfs.ReadFile(fsys, \"other/b.txt\") // M1\n\tfs.ReadFile(fsys, \"static/a.txt\")\n}\n\nfunc f() {\n\tserve(static)\n\tserve(static)\n}\n",
+			files: map[string]string{"static/a.txt": "x", "other/b.txt": "x"},
+			want:  map[string]string{"not-embedded": "M1"},
+		},
+		{
+			name:  "parameter fed different embed variables",
+			body:  "//go:embed static\nvar static embed.FS\n\n//go:embed other\nvar other embed.FS\n\nfunc serve(fsys fs.FS) {\n\tfs.ReadFile(fsys, \"nowhere.txt\")\n}\n\nfunc f() {\n\tserve(static)\n\tserve(other)\n}\n",
+			files: map[string]string{"static/a.txt": "x", "other/b.txt": "x"},
+			not:   []string{"not-embedded"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
