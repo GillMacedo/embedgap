@@ -998,6 +998,10 @@ func (c *checker) trackAll() {
 				path += "_test"
 			}
 			conf.Check(path, c.fset, u.files, u.info)
+			// Build the parameter index before following assignments, so a
+			// parameter that is assigned in its body is already untracked
+			// when the rounds below run.
+			c.unitParams(u)
 		}
 		for _, v := range ps.vars {
 			if v.kind != kindFS {
@@ -1017,6 +1021,18 @@ func (c *checker) trackAll() {
 				c.tracked[v.obj] = ref
 				if !v.test && ast.IsExported(v.name) {
 					c.exported[ps.lp.ImportPath+"."+v.name] = ref
+				}
+			}
+		}
+	}
+	// A parameter assigned anywhere in its function's body (even in a
+	// closure) can name a different file set at each read, so it is
+	// untracked before any call-site value or assignment could resolve it.
+	for _, ps := range c.pkgs {
+		for _, u := range ps.units {
+			if idx := c.params[u]; idx != nil {
+				for o := range idx.assigned {
+					c.untracked[o] = true
 				}
 			}
 		}
@@ -1204,12 +1220,14 @@ type paramSlot struct {
 }
 
 // paramIndex records, for one unit, the parameters of its unexported
-// non-variadic plain functions, the direct call sites of those functions, and
-// the functions used as values, whose call sites no index can cover.
+// non-variadic plain functions, the direct call sites of those functions,
+// the functions used as values, whose call sites no index can cover, and
+// the parameters assigned somewhere in their own function.
 type paramIndex struct {
-	params  map[types.Object]*paramSlot
-	calls   map[types.Object][]*ast.CallExpr
-	escaped map[types.Object]bool
+	params   map[types.Object]*paramSlot
+	calls    map[types.Object][]*ast.CallExpr
+	escaped  map[types.Object]bool
+	assigned map[types.Object]bool
 }
 
 // variadic reports whether a function type ends in ...T.
@@ -1227,9 +1245,10 @@ func (c *checker) unitParams(u *unit) *paramIndex {
 		return idx
 	}
 	idx := &paramIndex{
-		params:  map[types.Object]*paramSlot{},
-		calls:   map[types.Object][]*ast.CallExpr{},
-		escaped: map[types.Object]bool{},
+		params:   map[types.Object]*paramSlot{},
+		calls:    map[types.Object][]*ast.CallExpr{},
+		escaped:  map[types.Object]bool{},
+		assigned: map[types.Object]bool{},
 	}
 	c.params[u] = idx
 	isCallee := map[*ast.Ident]bool{}
@@ -1238,6 +1257,15 @@ func (c *checker) unitParams(u *unit) *paramIndex {
 			switch x := n.(type) {
 			case *ast.FuncDecl:
 				if x.Recv != nil || x.Body == nil || ast.IsExported(x.Name.Name) || variadic(x.Type) || x.Type.Params == nil {
+					return true
+				}
+				if x.Type.TypeParams != nil {
+					// A generic function is called through its type
+					// parameters, as in serve[T](x), so its callee isn't a
+					// plain identifier and no call site lands in idx.calls.
+					// Its type parameters are types, not fs values. Leave
+					// generic functions out of the index explicitly, rather
+					// than depending on that accident.
 					return true
 				}
 				fn, _ := u.info.Defs[x.Name].(*types.Func)
@@ -1252,6 +1280,7 @@ func (c *checker) unitParams(u *unit) *paramIndex {
 						n += len(field.Names)
 					}
 				}
+				own := map[types.Object]bool{}
 				i := 0
 				for _, field := range x.Type.Params.List {
 					if len(field.Names) == 0 {
@@ -1261,10 +1290,46 @@ func (c *checker) unitParams(u *unit) *paramIndex {
 					for _, id := range field.Names {
 						if o := u.info.Defs[id]; o != nil {
 							idx.params[o] = &paramSlot{fn: fn, index: i, nargs: n}
+							own[o] = true
 						}
 						i++
 					}
 				}
+				// A parameter assigned anywhere below this declaration, in
+				// the body or in a closure, can name a different file set at
+				// each read, so reads through it are never followed.
+				markParam := func(id *ast.Ident) {
+					if id == nil {
+						return
+					}
+					if o := u.info.Uses[id]; own[o] {
+						idx.assigned[o] = true
+					}
+				}
+				targetIdent := func(e ast.Expr) *ast.Ident {
+					id, ok := unparen(e).(*ast.Ident)
+					if !ok {
+						return nil
+					}
+					return id
+				}
+				ast.Inspect(x.Body, func(n ast.Node) bool {
+					switch y := n.(type) {
+					case *ast.AssignStmt:
+						for _, l := range y.Lhs {
+							markParam(targetIdent(l))
+							if ix, ok := unparen(l).(*ast.IndexExpr); ok {
+								markParam(targetIdent(ix.X)) // m[i] = ...
+							}
+							if se, ok := unparen(l).(*ast.StarExpr); ok {
+								markParam(targetIdent(se.X)) // *p = ...
+							}
+						}
+					case *ast.IncDecStmt:
+						markParam(targetIdent(y.X))
+					}
+					return true
+				})
 			case *ast.CallExpr:
 				if id, ok := unparen(x.Fun).(*ast.Ident); ok {
 					if o := u.info.Uses[id]; o != nil {
