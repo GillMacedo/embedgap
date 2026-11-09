@@ -1358,6 +1358,62 @@ func findRangeVals(u *unit) map[types.Object][]string {
 			return true
 		})
 	}
+	// The value variable of a range over a map of []string gets the same
+	// care: the loop can change the slice it holds, with an index
+	// assignment, an append, or a call that keeps it, and then the literal's
+	// strings no longer say what its elements are.
+	valVars := map[types.Object]bool{}
+	for _, r := range ranges {
+		if v := rangeObj(u, r.Value); v != nil && sliceOfStrings(v) {
+			valVars[v] = true
+		}
+	}
+	markValVar := func(e ast.Expr) {
+		ast.Inspect(e, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if o := u.info.Uses[id]; valVars[o] {
+				assigned[o] = true
+			}
+			return true
+		})
+	}
+	for _, f := range u.files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				for _, l := range x.Lhs {
+					if ix, ok := unparen(l).(*ast.IndexExpr); ok {
+						if id, ok := unparen(ix.X).(*ast.Ident); ok {
+							if o := u.info.Uses[id]; valVars[o] {
+								assigned[o] = true
+							}
+						}
+					}
+				}
+				for _, r := range x.Rhs {
+					markValVar(r)
+				}
+			case *ast.ValueSpec:
+				for _, r := range x.Values {
+					markValVar(r)
+				}
+			case *ast.CallExpr:
+				if id, ok := unparen(x.Fun).(*ast.Ident); ok {
+					if b, isB := u.info.Uses[id].(*types.Builtin); isB && safeCallArgs[b.Name()] {
+						return true
+					}
+				}
+				markValVar(x.Fun)
+				for _, a := range x.Args {
+					markValVar(a)
+				}
+			}
+			return true
+		})
+	}
 	vals := map[types.Object][]string{}
 	elems := map[types.Object][]string{}
 	add := func(m map[types.Object][]string, o types.Object, ss []string, changed *bool) {
@@ -1495,6 +1551,24 @@ func hasString(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// safeCallArgs lists the builtins whose arguments stay put, so a range value
+// can reach them without its elements changing.
+var safeCallArgs = map[string]bool{
+	"len": true, "cap": true, "delete": true,
+	"print": true, "println": true, "min": true, "max": true,
+}
+
+// sliceOfStrings reports whether o is a variable of a slice of strings,
+// named or not.
+func sliceOfStrings(o types.Object) bool {
+	v, ok := o.(*types.Var)
+	if !ok || v.Type() == nil {
+		return false
+	}
+	s, ok := v.Type().Underlying().(*types.Slice)
+	return ok && types.Identical(s.Elem(), types.Typ[types.String])
 }
 
 // rangeSubs lists the substitutions to try for a path expression: one map
