@@ -165,6 +165,7 @@ func TestFindings(t *testing.T) {
 		files map[string]string
 		want  map[string]string // code -> marker on the flagged line
 		not   []string          // codes that must not appear
+		note  bool              // the read must be listed in the unchecked note
 	}{
 		{
 			name:  "typo in file name",
@@ -237,6 +238,27 @@ func TestFindings(t *testing.T) {
 			body:  "//go:embed templates/*.html\nvar tmpl embed.FS\n\nfunc f() {\n\tpages := map[string]string{\"index\": \"index.html\", \"about\": \"about.html\"}\n\tfor name := range pages {\n\t\ttemplate.ParseFS(tmpl, \"templates/\"+name+\".html\")\n\t}\n}\n",
 			files: map[string]string{"templates/index.html": "x", "templates/about.html": "x"},
 			not:   []string{"no-match", "not-embedded", "unchecked"},
+		},
+		{
+			name:  "map loop value reassigned by index stays unchecked",
+			body:  "//go:embed templates/*.html\nvar tmpl embed.FS\n\nfunc f() {\n\tpages := map[string][]string{\"index\": {\"layout.html\", \"gone.html\"}}\n\tfor _, deps := range pages {\n\t\tdeps[0] = \"gone.html\"\n\t\tfor _, dep := range deps {\n\t\t\ttemplate.ParseFS(tmpl, \"templates/\"+dep)\n\t\t}\n\t}\n}\n",
+			files: map[string]string{"templates/layout.html": "x"},
+			note:  true,
+			not:   []string{"no-match", "not-embedded"},
+		},
+		{
+			name:  "map loop value appended to stays unchecked",
+			body:  "//go:embed templates/*.html\nvar tmpl embed.FS\n\nfunc f() {\n\tpages := map[string][]string{\"index\": {\"layout.html\", \"gone.html\"}}\n\tfor _, deps := range pages {\n\t\tdeps = append(deps, \"gone.html\")\n\t\tfor _, dep := range deps {\n\t\t\ttemplate.ParseFS(tmpl, \"templates/\"+dep)\n\t\t}\n\t}\n}\n",
+			files: map[string]string{"templates/layout.html": "x"},
+			note:  true,
+			not:   []string{"no-match", "not-embedded"},
+		},
+		{
+			name:  "map loop value passed to a function stays unchecked",
+			body:  "//go:embed templates/*.html\nvar tmpl embed.FS\n\nfunc consume(list []string) {}\n\nfunc f() {\n\tpages := map[string][]string{\"index\": {\"layout.html\", \"gone.html\"}}\n\tfor _, deps := range pages {\n\t\tconsume(deps)\n\t\tfor _, dep := range deps {\n\t\t\ttemplate.ParseFS(tmpl, \"templates/\"+dep)\n\t\t}\n\t}\n}\n",
+			files: map[string]string{"templates/layout.html": "x"},
+			note:  true,
+			not:   []string{"no-match", "not-embedded"},
 		},
 		{
 			name:  "leading slash",
@@ -334,6 +356,9 @@ func TestFindings(t *testing.T) {
 				if hasCode(rep, code, 0) {
 					t.Errorf("unexpected %s: %v", code, codes(rep))
 				}
+			}
+			if tc.note && !hasCode(rep, "unchecked", 0) {
+				t.Errorf("the read should be listed as unchecked: %v", codes(rep))
 			}
 			if len(tc.want) > 0 && r.code != exitFindings {
 				t.Errorf("exit %d, want 1", r.code)
