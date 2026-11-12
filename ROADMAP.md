@@ -2,7 +2,7 @@
 
 ## Next
 - Follow an `fs.FS` passed as a function argument or stored in a struct field
-- Check paths taken from a map or slice literal of constants, like miniflux's template list
+- Check globs built at run time, like `ParseFS(fsys, "templates/" + name)`, for any possible match
 - A `--goos` list that reruns the check for each platform and merges the notes
 
 ## Later

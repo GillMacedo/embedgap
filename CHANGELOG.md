@@ -4,10 +4,8 @@ All notable changes are documented here, in [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-11-08
-
 ### Added
-- Checks `ParseFS` and `fs.Glob` patterns built at run time, like `"templates/" + name + ".html"`, for any possible match.
+- Checks paths built from a loop over a local map or slice literal of string constants, one value at a time, such as miniflux's template list.
 
 ## [0.1.0] - 2026-11-07
 
