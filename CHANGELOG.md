@@ -4,10 +4,8 @@ All notable changes are documented here, in [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-11-08
-
 ### Added
-- Checks `ParseFS` and `fs.Glob` patterns built at run time, like `"templates/" + name + ".html"`, for any possible match.
+- Checks reads through an `fs.FS` function parameter when every call site in the package passes the same embed variable.
 
 ## [0.1.0] - 2026-11-07
 

@@ -616,7 +616,11 @@ type checker struct {
 	tracked   map[types.Object]*fsRef
 	untracked map[types.Object]bool
 	// exported package-level FS values, for use from other packages
-	exported  map[string]*fsRef // "importpath.Name"
+	exported map[string]*fsRef // "importpath.Name"
+	// per-unit indexes of function parameters that may be followed to the
+	// embed variable they receive
+	params    map[*unit]*paramIndex
+	visiting  map[types.Object]bool // parameter resolutions in progress
 	findings  []finding
 	checked   int
 	unchecked []string
@@ -643,6 +647,8 @@ func check(opts options) (*report, error) {
 		tracked:   map[types.Object]*fsRef{},
 		untracked: map[types.Object]bool{},
 		exported:  map[string]*fsRef{},
+		params:    map[*unit]*paramIndex{},
+		visiting:  map[types.Object]bool{},
 		seen:      map[string]bool{},
 	}
 	for _, lp := range pkgs {
@@ -992,6 +998,10 @@ func (c *checker) trackAll() {
 				path += "_test"
 			}
 			conf.Check(path, c.fset, u.files, u.info)
+			// Build the parameter index before following assignments, so a
+			// parameter that is assigned in its body is already untracked
+			// when the rounds below run.
+			c.unitParams(u)
 		}
 		for _, v := range ps.vars {
 			if v.kind != kindFS {
@@ -1011,6 +1021,18 @@ func (c *checker) trackAll() {
 				c.tracked[v.obj] = ref
 				if !v.test && ast.IsExported(v.name) {
 					c.exported[ps.lp.ImportPath+"."+v.name] = ref
+				}
+			}
+		}
+	}
+	// A parameter assigned anywhere in its function's body (even in a
+	// closure) can name a different file set at each read, so it is
+	// untracked before any call-site value or assignment could resolve it.
+	for _, ps := range c.pkgs {
+		for _, u := range ps.units {
+			if idx := c.params[u]; idx != nil {
+				for o := range idx.assigned {
+					c.untracked[o] = true
 				}
 			}
 		}
@@ -1190,6 +1212,190 @@ func (c *checker) isPkgFunc(u *unit, call *ast.CallExpr, pkg, name string) bool 
 	return p == pkg && n == name
 }
 
+// paramSlot is a parameter of a plain function, by position in its signature.
+type paramSlot struct {
+	fn    *types.Func
+	index int // position among the signature's parameters
+	nargs int // number of parameters, for matching call sites
+}
+
+// paramIndex records, for one unit, the parameters of its unexported
+// non-variadic plain functions, the direct call sites of those functions,
+// the functions used as values, whose call sites no index can cover, and
+// the parameters assigned somewhere in their own function.
+type paramIndex struct {
+	params   map[types.Object]*paramSlot
+	calls    map[types.Object][]*ast.CallExpr
+	escaped  map[types.Object]bool
+	assigned map[types.Object]bool
+}
+
+// variadic reports whether a function type ends in ...T.
+func variadic(ft *ast.FuncType) bool {
+	if len(ft.Params.List) == 0 {
+		return false
+	}
+	_, ok := ft.Params.List[len(ft.Params.List)-1].Type.(*ast.Ellipsis)
+	return ok
+}
+
+// unitParams builds the parameter index of a unit once.
+func (c *checker) unitParams(u *unit) *paramIndex {
+	if idx := c.params[u]; idx != nil {
+		return idx
+	}
+	idx := &paramIndex{
+		params:   map[types.Object]*paramSlot{},
+		calls:    map[types.Object][]*ast.CallExpr{},
+		escaped:  map[types.Object]bool{},
+		assigned: map[types.Object]bool{},
+	}
+	c.params[u] = idx
+	isCallee := map[*ast.Ident]bool{}
+	for _, f := range u.files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.FuncDecl:
+				if x.Recv != nil || x.Body == nil || ast.IsExported(x.Name.Name) || variadic(x.Type) || x.Type.Params == nil {
+					return true
+				}
+				if x.Type.TypeParams != nil {
+					// A generic function is called through its type
+					// parameters, as in serve[T](x), so its callee isn't a
+					// plain identifier and no call site lands in idx.calls.
+					// Its type parameters are types, not fs values. Leave
+					// generic functions out of the index explicitly, rather
+					// than depending on that accident.
+					return true
+				}
+				fn, _ := u.info.Defs[x.Name].(*types.Func)
+				if fn == nil {
+					return true
+				}
+				n := 0
+				for _, field := range x.Type.Params.List {
+					if len(field.Names) == 0 {
+						n++
+					} else {
+						n += len(field.Names)
+					}
+				}
+				own := map[types.Object]bool{}
+				i := 0
+				for _, field := range x.Type.Params.List {
+					if len(field.Names) == 0 {
+						i++
+						continue
+					}
+					for _, id := range field.Names {
+						if o := u.info.Defs[id]; o != nil {
+							idx.params[o] = &paramSlot{fn: fn, index: i, nargs: n}
+							own[o] = true
+						}
+						i++
+					}
+				}
+				// A parameter assigned anywhere below this declaration, in
+				// the body or in a closure, can name a different file set at
+				// each read, so reads through it are never followed.
+				markParam := func(id *ast.Ident) {
+					if id == nil {
+						return
+					}
+					if o := u.info.Uses[id]; own[o] {
+						idx.assigned[o] = true
+					}
+				}
+				targetIdent := func(e ast.Expr) *ast.Ident {
+					id, ok := unparen(e).(*ast.Ident)
+					if !ok {
+						return nil
+					}
+					return id
+				}
+				ast.Inspect(x.Body, func(n ast.Node) bool {
+					switch y := n.(type) {
+					case *ast.AssignStmt:
+						for _, l := range y.Lhs {
+							markParam(targetIdent(l))
+							if ix, ok := unparen(l).(*ast.IndexExpr); ok {
+								markParam(targetIdent(ix.X)) // m[i] = ...
+							}
+							if se, ok := unparen(l).(*ast.StarExpr); ok {
+								markParam(targetIdent(se.X)) // *p = ...
+							}
+						}
+					case *ast.IncDecStmt:
+						markParam(targetIdent(y.X))
+					}
+					return true
+				})
+			case *ast.CallExpr:
+				if id, ok := unparen(x.Fun).(*ast.Ident); ok {
+					if o := u.info.Uses[id]; o != nil {
+						idx.calls[o] = append(idx.calls[o], x)
+						isCallee[id] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	for _, f := range u.files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok || isCallee[id] {
+				return true
+			}
+			if fn, ok := u.info.Uses[id].(*types.Func); ok {
+				idx.escaped[fn] = true
+			}
+			return true
+		})
+	}
+	return idx
+}
+
+// resolveParam follows a function parameter used as an fs.FS operand. When
+// every call site of the function in the package passes the same embed
+// variable in the same directory, reads through the parameter are reads of
+// that variable; any disagreement keeps them unchecked.
+func (c *checker) resolveParam(u *unit, o types.Object) *fsRef {
+	idx := c.unitParams(u)
+	slot := idx.params[o]
+	if slot == nil || idx.escaped[slot.fn] || c.visiting[o] {
+		return nil
+	}
+	sites := idx.calls[slot.fn]
+	if len(sites) == 0 {
+		return nil
+	}
+	c.visiting[o] = true
+	defer delete(c.visiting, o)
+	var ref *fsRef
+	for _, call := range sites {
+		if call.Ellipsis.IsValid() || len(call.Args) != slot.nargs {
+			return nil
+		}
+		arg := call.Args[slot.index]
+		if id, ok := unparen(arg).(*ast.Ident); ok && u.info.Uses[id] == o {
+			continue // the function passes its own parameter on
+		}
+		r := c.resolveFS(u, arg)
+		if r == nil {
+			return nil
+		}
+		if ref == nil {
+			ref = r
+			continue
+		}
+		if ref.v != r.v || ref.prefix != r.prefix {
+			return nil
+		}
+	}
+	return ref
+}
+
 // resolveFS says which embed variable and directory an expression refers to,
 // or nil if it can't tell.
 func (c *checker) resolveFS(u *unit, e ast.Expr) *fsRef {
@@ -1200,7 +1406,10 @@ func (c *checker) resolveFS(u *unit, e ast.Expr) *fsRef {
 		if o == nil || c.untracked[o] {
 			return nil
 		}
-		return c.tracked[o]
+		if ref := c.tracked[o]; ref != nil {
+			return ref
+		}
+		return c.resolveParam(u, o)
 	case *ast.SelectorExpr:
 		id, ok := x.X.(*ast.Ident)
 		if !ok {
